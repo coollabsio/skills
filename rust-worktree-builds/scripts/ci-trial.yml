@@ -1,0 +1,82 @@
+name: CI trial (cache comparison)
+
+# Compares Rust cache setups on a few test files: no cache, Swatinem/rust-cache, and sccache on the
+# GitHub Actions cache. Each job builds the test binaries once, then runs them.
+# Push this to its own branch (not the default branch). Re-run the workflow to see warm-cache times.
+#
+# Replace: <crate> (the package with the tests), the --test list, and the toolchain.
+# Add the steps your test build needs (a database service, a frontend build, generated files).
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci-trial]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI builds once: incremental data and debug info only cost disk, cache size and link time.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CRATE: <crate>
+  TESTS: >-
+    --test first_file --test second_file --test third_file
+
+jobs:
+  tests:
+    name: tests (${{ matrix.cache }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cache: [none, rust-cache, sccache]
+    # Example database service; remove it if the tests do not need one.
+    # services:
+    #   postgres:
+    #     image: postgres:17-alpine
+    #     env:
+    #       POSTGRES_USER: test
+    #       POSTGRES_PASSWORD: test
+    #       POSTGRES_DB: test
+    #     ports: ["5432:5432"]
+    #     options: >-
+    #       --health-cmd "pg_isready -U test" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: matrix.cache == 'rust-cache'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: trial-tests
+          # Only long-lived branches write the cache; pull requests read it.
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci-trial' }}
+      - if: matrix.cache == 'sccache'
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - if: matrix.cache == 'sccache'
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Build test binaries
+        run: |
+          start=$(date +%s)
+          cargo test -p "$CRATE" --no-run $TESTS
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: cargo test -p "$CRATE" $TESTS
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.cache }} (attempt ${{ github.run_attempt }})"
+            echo "- build: ${BUILD_SECONDS:-?} s"
+            echo "- target/: $(du -sh target | cut -f1), disk free: $(df -h / | awk 'NR==2{print $4}')"
+            if [ "${{ matrix.cache }}" = sccache ]; then
+              echo '```'; sccache --show-stats | grep -E '^(Compile requests|Cache hits|Cache misses|Cache errors)'; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
