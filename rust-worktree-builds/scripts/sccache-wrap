@@ -1,0 +1,22 @@
+#!/bin/sh
+# rustc wrapper: sccache with every checkout root as a basedir, so all worktrees share cache entries.
+# Set in ~/.cargo/config.toml:  [build] rustc-wrapper = "/home/<you>/.local/bin/sccache-wrap"
+#
+# sccache reads SCCACHE_BASEDIRS only when its server starts. The server stops after SCCACHE_IDLE_TIMEOUT
+# idle seconds, and the next build starts it again with the current list.
+# Docs: https://github.com/mozilla/sccache/blob/main/docs/Configuration.md
+
+# Space-separated globs of checkout roots. Each match must be the root of one checkout (the folder that holds
+# the workspace Cargo.toml), not a parent of several checkouts. Override with the environment variable.
+SCCACHE_WRAP_ROOTS="${SCCACHE_WRAP_ROOTS:-$HOME/src/*/ $HOME/worktrees/*/*/}"
+SCCACHE_BIN="${SCCACHE_BIN:-/usr/local/bin/sccache}"
+
+dirs=""
+for d in $SCCACHE_WRAP_ROOTS; do
+    [ -d "$d" ] && dirs="$dirs${dirs:+:}${d%/}"
+done
+export SCCACHE_BASEDIRS="$dirs"
+# Crates that bake env!("CARGO_MANIFEST_DIR") into their output stay per checkout.
+export SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS="${SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS:-CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH}"
+export SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-300}"
+exec "$SCCACHE_BIN" "$@"
