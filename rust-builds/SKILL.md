@@ -1,9 +1,9 @@
 ---
-name: rust-worktree-builds
+name: rust-builds
 description: Cut CPU and disk use of Rust builds when many git worktrees or parallel agents build one Cargo workspace on one machine, and speed up Rust CI and slow tests. Sets up a machine-wide sccache with basedirs, measures before and after, finds what fills target/, adds agent rules for tests, checks and benchmarks GitHub Actions caching, and profiles slow tests. Use when Rust builds are slow across worktrees, target/ folders fill the disk, the user asks to share a build cache between checkouts, Rust CI is slow, or tests take seconds each.
 ---
 
-# Rust builds across many worktrees
+# Rust builds: worktrees, CI and tests
 
 Many worktrees of one Rust workspace each compile the same dependencies again, and each keeps its own
 `target/` of 4–30 GB. This skill reduces the CPU cost, finds what uses the disk, and stops agents from

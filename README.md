@@ -5,4 +5,4 @@ project's `.claude/skills/`) to use it.
 
 | Skill | Use |
 |---|---|
-| [`rust-worktree-builds`](rust-worktree-builds/SKILL.md) | Cut CPU and disk use of Rust builds across many git worktrees and parallel agents (sccache with basedirs, disk analysis, agent rules for tests), speed up GitHub Actions caching, and profile slow tests |
+| [`rust-builds`](rust-builds/SKILL.md) | Cut CPU and disk use of Rust builds across many git worktrees and parallel agents (sccache with basedirs, disk analysis, agent rules for tests), speed up GitHub Actions caching, and profile slow tests |
