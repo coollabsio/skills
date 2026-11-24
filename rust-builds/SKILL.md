@@ -1,6 +1,6 @@
 ---
 name: rust-builds
-description: Cut CPU and disk use of Rust builds when many git worktrees or parallel agents build one Cargo workspace on one machine, and speed up Rust CI and slow tests. Sets up a machine-wide sccache with basedirs, measures before and after, finds what fills target/, adds agent rules for tests, checks and benchmarks GitHub Actions caching, and profiles slow tests. Use when Rust builds are slow across worktrees, target/ folders fill the disk, the user asks to share a build cache between checkouts, Rust CI is slow, or tests take seconds each.
+description: Cut CPU and disk use of Rust builds when many git worktrees or parallel agents build one Cargo workspace on one machine, and speed up Rust CI and slow tests. Sets up a machine-wide sccache with basedirs, measures before and after, finds what fills target/, adds agent rules for tests, checks and benchmarks GitHub Actions caching, merges integration tests into one test binary, and profiles slow tests. Use when Rust builds are slow across worktrees, target/ folders fill the disk, the user asks to share a build cache between checkouts, Rust CI is slow, tests take seconds each, or the user asks whether to rewrite in another language for build speed.
 ---
 
 # Rust builds: worktrees, CI and tests
@@ -127,15 +127,66 @@ Typical findings in one project (ext4, 15 worktrees, 610 dependencies):
 
 Options, best first:
 
-1. **Agents build only the tests they need** (step 6). Biggest win, no code change.
-2. **Fewer test binaries.** Each file in `tests/` is its own binary. Merge small files into a few groups
-   (`tests/<group>/main.rs` with `mod file;` lines) and share one fixture module. Costs: merge conflicts with
-   open branches, a forgotten `mod` line silently skips tests, one crate recompiles all its tests on an edit,
-   tests from different files run in one process. Measure the edit-loop time before and after.
+1. **One test binary** (step 5.1). Biggest win for disk and for full-suite builds.
+2. **Agents build only the tests they need** (step 6). No code change.
 3. **Clean idle `target/` folders** (cron, by last build time). With sccache the rebuild is cheap.
 4. **Move benchmarks out of `tests/`** (to `benches/`); an `#[ignore]` benchmark still builds a binary.
 5. **btrfs with `compress=zstd`** (+ `bees`/`duperemove` for dedup) only if the disk is still too full: it
    needs a filesystem change. ext4 and Cargo/sccache cannot share files between checkouts.
+
+### 5.1 Merge all integration tests into one test binary
+
+Each file in `tests/` is its own binary that links the whole crate and all dependencies. Make them modules of
+one binary. Measured in one project (118 test files, 114k test lines, 214k-line server crate, 12 cores):
+
+| Measure | One binary per file | One binary |
+|---|---|---|
+| Test binaries on disk | 22 GB | 410 MB |
+| Crate edit, whole suite built | 3 min 25 s | 24 s |
+| Crate edit, one test file built | 20 s | 24 s (the whole suite) |
+| Test-only edit, rebuild | 1.7 s | 5.6 s |
+| Full run with nextest | 5 min 36 s | 3 min 2 s |
+
+Steps (no file moves, so `git log` per file and relative `include_str!` paths stay the same):
+
+1. In the crate's `Cargo.toml`: `autotests = false` under `[package]`, and
+   `[[test]] name = "it"`, `path = "tests/it.rs"`.
+2. Generate `tests/it.rs` with a script: crate attributes (`#![recursion_limit]` and so on, removed from the
+   files), then `mod <helper>;` once for each shared helper folder, then `mod <file>;` for each file.
+3. In each file, replace `mod <helper>;` with `use crate::<helper>;`. A helper that refers to another helper
+   already uses `crate::`, which still works. Remove imports that are now unused.
+4. Add a guard test in `it.rs`: with `autotests = false`, cargo skips a file that has no `mod` line, and
+   nothing fails. Remove one `mod` line to prove the guard fails.
+   ```rust
+   #[test]
+   fn every_test_file_is_a_module_of_it() {
+       let root = include_str!("it.rs");
+       let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+       let missing: Vec<String> = std::fs::read_dir(dir).unwrap()
+           .map(|e| e.unwrap().file_name().into_string().unwrap())
+           .filter_map(|n| n.strip_suffix(".rs").map(str::to_owned))
+           .filter(|n| n != "it" && !root.contains(&format!("\nmod {n};\n")))
+           .collect();
+       assert!(missing.is_empty(), "add `mod <file>;` to tests/it.rs for: {missing:?}");
+   }
+   ```
+5. Check process-global state before the merge: `grep -n 'set_var\|remove_var\|set_current_dir' tests/`,
+   and statics that one file expects to own. Under `cargo test`, all tests share one process.
+6. Use **cargo-nextest** (`curl -LsSf https://get.nexte.st/0.9/linux | tar zxf - -C ~/.cargo/bin`). It runs
+   each test in its own process, so one crash or abort does not stop the other tests.
+7. **Stack overflows.** A test that overflows the 2 MiB test-thread stack (large `async` futures in debug
+   builds) aborts the whole binary under `cargo test`. In one project, 6 import tests did this already in the
+   old layout. Fix with `.cargo/config.toml` in the repo: `[env] RUST_MIN_STACK = "8388608"`.
+8. Before you merge, run the full suite in the old layout (in a `git archive HEAD` copy with its own
+   `CARGO_TARGET_DIR`) and compare the list of failures. The same list in both layouts proves that the merge
+   did not break tests. Then update the agent rules (step 6) and every doc that shows `--test <file>`.
+
+Commands after the merge: one file `cargo nextest run -p <crate> --test it <file>::`, one test
+`<file>::<test_name>`, several files `-E 'test(/^a::/) | test(/^b::/)'`. With `cargo test`, put the filter
+after `--`: `cargo test -p <crate> --test it -- a:: b::`.
+
+Do the merge when few branches are open: each open branch that adds a test file needs one `mod` line after a
+rebase.
 
 Before you delete any `target/`, list the running binaries from it (`ps -eo pid,args | grep target/`). Running
 processes keep working; they rebuild on the next start.
@@ -151,7 +202,8 @@ has no value: CI must run the full suite on each PR and block the merge.
 switched to manual runs ("temporarily") two months earlier, and 3 test files no longer compiled. The rule
 "CI runs the full suite" is false until CI runs on each PR and its result blocks the merge.
 
-Add this section to the project's agent instructions, with the project's crate and folder names:
+Add this section to the project's agent instructions, with the project's crate and folder names. If you did
+step 5.1, use the second version below.
 
 ```markdown
 ## Tests: build only the tests you need
@@ -170,7 +222,31 @@ full suite.
 - Run the full suite only when the user asks for it.
 ```
 
+After step 5.1:
+
+```markdown
+## Tests: one test binary, run only the tests you need
+
+All files in `<crate>/tests/` are modules of one test binary, `it` (`tests/it.rs`). A new test file needs a
+`mod <file>;` line in `tests/it.rs`. Shared helpers are declared once there; a test file imports them with
+`use crate::<helper>;`.
+
+- Run tests with `cargo nextest run`. One file: `cargo nextest run -p <crate> --test it <file>::`. One test:
+  `<file>::<test_name>`. Several files: `-E 'test(/^a::/) | test(/^b::/)'`.
+- A filtered run still compiles the whole `it` binary (test-only edit ≈ <N> s, crate edit ≈ <N> s).
+- In a worktree, do not run the full suite unless the user asks for it.
+- When you change a signature that other code calls, run `cargo check -p <crate> --tests`.
+```
+
 Also add a one-line pointer next to any doc that lists the full-suite commands ("these are for CI").
+
+**When CI does not run the tests, they drift.** In one project, CI was removed; weeks later 24 tests failed on
+HEAD. All 24 were stale expectations of intended changes (new response fields, new tools, a new route, changed
+status codes, a moved trial column that test fixtures still set the old way). None was a server bug. Fix them
+by group (parallel subagents work well), and for each one find the commit that changed the behavior
+(`git log -S`) before you change an expectation. Check the ones that look like security bugs (a scope leak, a
+body limit, guest access, read-only enforcement) against the code, not only against the history. Replace counts
+such as `assert_eq!(tools.len(), 10)` with exact lists, so the next drift names the new item.
 
 `cargo check -p <crate> --tests` is the key check: in one project it took 76 s and 2.8 GB, against about 28 GB
 for building all test binaries, and it found 3 test files that had not compiled since a signature change.
@@ -287,8 +363,22 @@ Common causes in one project (each SQLite test took 2–3 s, Postgres 1–3 s):
    change: `cargo test … --config 'profile.dev.package.<crate>.opt-level=3'`.
 2. **Template database.** Migrate one database for each test binary, then copy it for each test (SQLite: copy
    the file; Postgres: `CREATE DATABASE … TEMPLATE <template>`). This needs one shared test helper.
-3. **cargo-nextest** runs tests from all binaries at the same time, so all cores stay busy. It does not reduce
-   CPU work.
+3. **cargo-nextest** runs tests from all binaries at the same time, so all cores stay busy, and each test in
+   its own process. It does not reduce CPU work. On a one-binary suite it took 3 min against 9 min for
+   `cargo test`, where many threads in one process caused high system time.
+4. **Optimize build scripts and proc macros:** `[profile.dev.build-override] opt-level = 3`. Measured: edit loop
+   −11% in one project (serde, sqlx, utoipa macros).
+5. Put the profile settings in the repo's `Cargo.toml`, not only in `~/.cargo/config.toml`, so Docker builds and
+   other machines get them too.
+
+## 9. "Should we rewrite in another language?"
+
+When slow builds make the user ask this, compare the cost of the build fixes in this skill (hours to days)
+with the cost of a rewrite (all lines again, all edge cases found again, no features for months). Most of the
+pain usually comes from one huge crate and one test binary per file, not from the language. Do steps 5.1 and
+8.2, then measure. If the edit loop is still too slow, split the critical-path crate (layered: shared types and
+store at the bottom, route crates above, one sink crate for generated lists such as OpenAPI). Discuss a
+rewrite only after these numbers.
 
 ## Report
 
